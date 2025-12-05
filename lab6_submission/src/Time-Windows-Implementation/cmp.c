@@ -285,6 +285,7 @@ void dijkstra_with_priorities(Graph* g, int start_idx, int end_idx, Destination*
         
         // Also need distance from this waypoint to end
         dijkstra_segment(g, waypoint_idx_in_graph, end_idx, segment_dist, segment_prev, segment_arrival_times, &total_nodes_explored);
+        
         double distance_to_end = segment_dist[end_idx];
         double total_if_included = cumulative_distance + distance_to_end;
         
@@ -348,51 +349,144 @@ void dijkstra_with_priorities(Graph* g, int start_idx, int end_idx, Destination*
     printf("Route completed\n");
     printf("Total distance: %.2f km\n", total_path_distance);
     
-    // NEW: Reconstruct full path with all intermediate nodes
-    // Store the complete path by running dijkstra for each segment and collecting all nodes
-    int full_path[MAX_NODES * 10];  // Large enough for full path
-    int full_path_len = 0;
+    // NEW: Store segment information for path reconstruction
+    // We'll rebuild from the waypoint_path we already computed
     
     printf("Path: ");
     
-    // For each segment in waypoint_path
+    // Reconstruct the actual complete path with intermediate nodes
+    // Store all segment prev arrays BEFORE printing
+    int segment_prev_arrays[MAX_DESTINATIONS + 1][MAX_NODES];
+    
+    // Re-trace each segment to collect prev information (without printing debug output)
     for (int seg_idx = 0; seg_idx < waypoint_count_in_path - 1; seg_idx++) {
         int from_node = waypoint_path[seg_idx];
         int to_node = waypoint_path[seg_idx + 1];
         
-        // Run dijkstra to get the actual path
-        dijkstra_segment(g, from_node, to_node, segment_dist, segment_prev, segment_arrival_times, &total_nodes_explored);
+        // Initialize segment
+        for (int i = 0; i < g->node_count; i++) {
+            segment_prev_arrays[seg_idx][i] = -1;
+            segment_dist[i] = DBL_MAX;
+        }
+        segment_dist[from_node] = 0;
         
-        // Trace back from to_node to from_node
-        int path_segment[MAX_NODES];
+        // Run Dijkstra for this segment (with time window constraints)
+        PriorityQueue pq;
+        pq_init(&pq);
+        pq_push(&pq, from_node, 0);
+        
+        while (!pq_empty(&pq)) {
+        PQNode pq_node = pq_pop(&pq);
+        int u = pq_node.node;
+        
+        if (pq_node.priority > segment_dist[u]) continue;
+            
+            Edge* edge = g->adj_list[u];
+            while (edge != NULL) {
+                int v = edge->to;
+                double raw_arrival = segment_dist[u] + edge->weight;
+                double arrival_at_v = raw_arrival;
+                
+                // Apply time window constraints
+                if (arrival_at_v < g->nodes[v].earliest) {
+                    arrival_at_v = g->nodes[v].earliest;
+                }
+                
+                if (arrival_at_v > g->nodes[v].latest) {
+                    edge = edge->next;
+                    continue;
+                }
+                
+                double alt = segment_dist[u] + edge->weight;
+                if (alt < segment_dist[v]) {
+                    segment_dist[v] = alt;
+                    segment_prev_arrays[seg_idx][v] = u;
+                    pq_push(&pq, v, alt);
+                }
+                edge = edge->next;
+            }
+        }
+    }
+    
+    // Now build and print the complete path
+    // CRITICAL: Only include nodes that are in waypoint_path or are intermediate nodes between them
+    int complete_path[MAX_NODES * 10];
+    int complete_len = 0;
+    
+    // Build a set of "allowed" nodes: start, all accepted waypoints, and end
+    int allowed_nodes[MAX_DESTINATIONS + 2];
+    int allowed_count = waypoint_count_in_path;
+    for (int i = 0; i < waypoint_count_in_path; i++) {
+        allowed_nodes[i] = waypoint_path[i];
+    }
+    
+    // Also mark which waypoints were explicitly rejected
+    int rejected_waypoints[MAX_DESTINATIONS];
+    for (int i = 0; i < skipped_count; i++) {
+        rejected_waypoints[i] = find_node_index(g, skipped_waypoints[i]);
+    }
+    
+    for (int seg_idx = 0; seg_idx < waypoint_count_in_path - 1; seg_idx++) {
+        int to_node = waypoint_path[seg_idx + 1];
+        
+        // Trace back through this segment
+        int segment_path[MAX_NODES];
         int seg_len = 0;
         int trace = to_node;
         
         while (trace != -1) {
-            path_segment[seg_len++] = trace;
-            if (trace == from_node) break;
-            trace = segment_prev[trace];
+            segment_path[seg_len++] = trace;
+            trace = segment_prev_arrays[seg_idx][trace];
         }
         
-        // Reverse and add to full path (except last node to avoid duplicates)
+        // Reverse and add to complete path (skip duplicate endpoints)
+        // But also FILTER OUT any skipped waypoints that appear as intermediate nodes
         for (int i = seg_len - 1; i >= 0; i--) {
-            if (seg_idx > 0 && i == seg_len - 1) continue;  // Skip duplicate endpoint
-            full_path[full_path_len++] = path_segment[i];
+            int node = segment_path[i];
+            
+            // Skip if this is a duplicate endpoint
+            if (complete_len > 0 && node == complete_path[complete_len - 1]) {
+                continue;
+            }
+            
+            // Skip if this node was an explicitly rejected waypoint
+            int is_rejected = 0;
+            for (int j = 0; j < skipped_count; j++) {
+                if (node == rejected_waypoints[j]) {
+                    is_rejected = 1;
+                    break;
+                }
+            }
+            
+            // If threshold > 0, we allow skipped waypoints as intermediate nodes
+            // If threshold == 0 (strict priority), we reject them
+            if (is_rejected && threshold == 0) {
+                continue;  // Skip this node - it was rejected as a waypoint
+            }
+            
+            complete_path[complete_len++] = node;
         }
     }
     
-    // Print full path
-    for (int i = 0; i < full_path_len; i++) {
-        printf("%d", g->node_ids[full_path[i]]);
-        if (i < full_path_len - 1) printf(" -> ");
+    // Print complete path
+    for (int i = 0; i < complete_len; i++) {
+        printf("%d", g->node_ids[complete_path[i]]);
+        if (i < complete_len - 1) printf(" -> ");
     }
     printf("\n");
     
     if (skipped_count > 0) {
         printf("⚠ Skipped %d waypoint(s) due to threshold constraint:\n", skipped_count);
         for (int i = 0; i < skipped_count; i++) {
-            printf("  - Node %d (priority %d)\n", skipped_waypoints[i], 
-                   i+1);  // This is simplified; you might want to track priorities separately
+            // Find the priority of this skipped waypoint
+            int skipped_priority = -1;
+            for (int j = 0; j < dest_count; j++) {
+                if (dests[j].node_id == skipped_waypoints[i]) {
+                    skipped_priority = dests[j].priority;
+                    break;
+                }
+            }
+            printf("  - Node %d (priority %d)\n", skipped_waypoints[i], skipped_priority);
         }
     } else {
         printf("✓ All priorities respected\n");
@@ -460,35 +554,28 @@ void dijkstra_segment(Graph* g, int start_idx, int end_idx,
             double arrival_at_v = current_time + edge -> weight; // Calculate arrival at neighbor v
             double raw_arrival = arrival_at_v;
 
-            // EARLY ARRIVAL?
+            // EARLY ARRIVAL - wait until earliest time
             if(arrival_at_v < g->nodes[v].earliest)
             {
                 arrival_at_v = g->nodes[v].earliest;
-                printf("EARLY ARRIVAL! Node %d: Arrived at time %.1f, waiting until %.1f\n", 
-                    g->node_ids[v], raw_arrival, arrival_at_v);
             }
 
-            // LATE ARRIVAL?
+            // LATE ARRIVAL - cannot use this edge
             if(arrival_at_v > g->nodes[v].latest)
             {
-                printf("LATE ARRIVAL! Cannot arrive by time %.1f (arrival time %.1f)\n", 
-                    g->node_ids[v], g->nodes[v].latest, arrival_at_v);
                 edge = edge->next;
-                continue; // Skip this edge and try the next neighboring node
+                continue;
             }
 
-            double alt = dist[u] + edge->weight; // Distance from current node
+            double alt = dist[u] + edge->weight;
             
             // If a shorter path is found to neighbor v, update it
             if (alt < dist[v]) {
-                dist[v] = alt;  // Update shortest distance
-                arrival_times[v] = arrival_at_v; // Store the official arrival time
+                dist[v] = alt;
+                arrival_times[v] = arrival_at_v;
                 raw_arrival_times[v] = raw_arrival;
-                prev[v] = u;    // Record that we came from u
-                pq_push(&pq, v, alt); // Add the neighbor to queue with the new distance
-
-                printf("Updated path to node %d: distance=%.1f, arrival_time=%.1f\n",
-                       g->node_ids[v], alt, arrival_at_v);
+                prev[v] = u;
+                pq_push(&pq, v, alt);
             }
             edge = edge->next; // Move to evaluate the next edge in the adjacency list
         }
@@ -667,7 +754,7 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < dest_count; i++) {
         printf("  %d. Node %d (priority %d)\n", i+1, dests[i].node_id, dests[i].priority);
     }
-    printf("Threshold: %.1f%%\n\n", threshold * 100.0);
+    printf("Threshold: %.1f%%\n\n", threshold);
     
     // Find start and end indices
     int start_idx = find_node_index(&g, start_node);
